@@ -15,13 +15,20 @@
 
 // COMMAND ----------
 
-import io.delta.tables.DeltaTable
-import org.apache.spark.sql.DataFrame
-import org.apache.spark.sql.functions._
+import com.snowflake.snowpark.{DataFrame=>SpDataFrame}
+import com.snowflake.snowpark._
+import com.snowflake.snowpark.types.{StringType, StructField, StructType}
+import com.snowflake.snowpark.functions._
 import com.snowflake.snowpark.Session
 import java.time.{ZoneOffset, ZonedDateTime}
-import scala.language.{postfixOps, reflectiveCalls}
 import com.databricks.dbutils_v1.DBUtilsHolder.dbutils
+import java.text.SimpleDateFormat
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.util.Calendar
+
+
+import scala.language.{postfixOps, reflectiveCalls}
 
 class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String, String], sfCDCM:Session) extends SparkSessionWrapper {
 
@@ -62,15 +69,6 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
   timeTravelDate = cdosBase.getDateForLookbackPeriod(timeTravel)
   println("timeTravelDate: " + timeTravelDate)
   
-  val snowflakeParams = cdosBase.setSnowflakeparameters().asInstanceOf[scala.collection.mutable.Map[String, String]]
-  val sfOptions = Map(
-    "sfUrl" ->  snowflakeParams("sfUrl"),
-    "sfUser" -> snowflakeParams("sfUser"),
-    "pem_private_key" -> snowflakeParams("pem_private_key"),
-    "sfWarehouse" -> snowflakeParams("sfWarehouse"),
-    "sfDatabase" ->snowflakeParams("sfDatabase"),
-    "SCHEMA" -> "CDCM_REFINED"
-   )
    if (notebookParams("targetMarket") != null)
       targetMarket = notebookParams("targetMarket").toLowerCase()
 
@@ -1118,7 +1116,7 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
   } else ""
 
    cdosBaseMedclaims.query_writer(targetMarket.toLowerCase, domainName,cdosBaseMedclaims.consumer, targetQuery)
-   
+   g
    val clmDtlCk =
 
          """
@@ -1384,6 +1382,7 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
       E_CODE_3 as E_Code_3,
       ICD_CODE_TYPE as Icd_Code_Type
      FROM """ + medDbName + "." + targetMarket + "_" + domainName + """ WHERE (UPDATE_TYPE IN ('ORIGINAL', 'ADJUSTMENT', 'BACKOUT') AND CLAIM_NUMBER IN ( """ + clmDtlCk + """))""" + filterDel_ind_1
+  
   def runNotebook(): String = {
 
 
@@ -1402,21 +1401,18 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
       println(s"CdosMedclaimHeader 1 : ${java.time.LocalDateTime.now}")
 
       cdosBaseMedclaims.dropTableifExists(medclaimHeaderSourceTable)
-      cdosBaseMedclaims.writeDataFrameToDeltaLake(SourceDF, medclaimHeaderSourceTable, "overWrite")
+      cdosBaseMedclaims.writeDataFrameToSnowflake(sourceDF, medclaimHeaderSourceTable, "overWrite")
+      
       val inscope_patient_sp_table = dbName + "_" + targetMarket + "_inscope_patient"
-      var inscopeDf_sp = spark.read
-    .format("snowflake")
-    .option("sfUrl", sfOptions("sfUrl"))
-    .option("sfDatabase", sfOptions("sfDatabase"))
-    .option("sfWarehouse", sfOptions("sfWarehouse"))
-    .option("sfUser", sfOptions("sfUser"))
-    .option("pem_private_key", sfOptions("pem_private_key"))
-    .option("dbtable", inscope_patient_sp_table)  
-    .load
-   
-   inscopeDf_sp.write.format("delta").mode("overwrite").saveAsTable(temp_inscope_patient_table)
 
-    val inscopeDF = spark.sql(
+      var inscopeDf_sp =  sfCDCM.table(inscope_patient_sp_table)  
+
+
+    cdosBaseMedclaims.dropTableifExists(temp_inscope_patient_table)
+    cdosBaseMedclaims.writeDataFrameToSnowflake(inscopeDf_sp, temp_inscope_patient_table, "overWrite")
+    println("inscopeDf_sp wrote to Snowflake")
+    
+    val inscopeDF = sfCDCM.sql(
         """ SELECT CLH.* FROM """ + medDbName + "." + targetMarket + "_" + domainName + """_source CLH
     INNER JOIN """ + temp_inscope_patient_table + """ IP
     ON CLH.SOURCE_PATIENT_ID = IP.SOURCE_PATIENT_ID
@@ -1429,12 +1425,12 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
       var medclaim_header_historyDF_temp: DataFrame = null
       if ("SDM2".equals(CdosConfigMapMedclaims.sdm_type)) {
         medclaim_header_historyDF_temp = medclaim_header_historyDF_temp_str
-          .withColumn("Charge_Amount",col("Charge_Amount").cast("decimal(32, 2)"))
+          .withColumn("Charge_Amount", col("Charge_Amount").cast(DecimalType(32, 2)))
 
       }
       if ("SDM3".equals(CdosConfigMapMedclaims.sdm_type)) {
         medclaim_header_historyDF_temp = medclaim_header_historyDF_temp_str
-          .withColumn("Charge_Amount",col("Charge_Amount").cast("string"))
+           .withColumn("Charge_Amount", col("Charge_Amount").cast(StringType))
       }
 
       println(s"CdosMedclaimHeader 2 : ${java.time.LocalDateTime.now}")
@@ -1458,62 +1454,55 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
 
       println(s"CdosMedclaimHeader 3 : ${java.time.LocalDateTime.now}")
 
-      val deltaDF = DeltaTable
-        .createIfNotExists()
-        .tableName(medDbName + "." + targetMarket + "_" + domainName)
-        .addColumns(medclaim_header_historyDF.schema)
-        .property("delta.enableChangeDataFeed", "true")
-        .execute
+    var doesTableExistCount = sfCDCM.sql("select count(*) from INFORMATION_SCHEMA.TABLES where table_name = upper('" + (medDbName + "." + targetMarket + "_" + domainName).split("\\.").last + "')").collect()(0)(0)
+
+    if (doesTableExistCount == 0) {
+      medclaim_header_historyDF().limit(0)
+        .write.mode(com.snowflake.snowpark.SaveMode.Append)
+        .saveAsTable(medDbName + "." + targetMarket + "_" + domainName)
+    }
+
+    sfCDCM.sql("alter table " + medDbName + "." + targetMarket + "_medclaim_header set change_tracking = true;").collect()
+    
+    var snowflakeFormattedDate = sfCDCM.sql("select current_timestamp() as SnowflakeFormattedDate").select("SnowflakeFormattedDate").collect().map(_.getTimestamp(0)).mkString("")
+
+    var labDelta = sfCDCM.table(medDbName + "." + targetMarket + "_medclaim_header")
+
+    val allColumns = medclaim_header_historyDF().schema.map(f => f.name -> medclaim_header_historyDF()(f.name)).toMap
+
+    labDelta
+      .merge(medclaim_header_historyDF(),
+        labDelta("TENANT_SK") === medclaim_header_historyDF()("TENANT_SK") and
+        labDelta("SOURCE_SYSTEM") === medclaim_header_historyDF()("SOURCE_SYSTEM") and
+        labDelta("CLAIM_NUMBER") === medclaim_header_historyDF()("CLAIM_NUMBER") and
+        !(labDelta("HASH") === medclaim_header_historyDF()("HASH")))
+      .whenMatched
+      .update(allColumns)
+      .collect()
+
+    labDelta
+      .merge(medclaim_header_historyDF(),
+        labDelta("TENANT_SK") === medclaim_header_historyDF()("TENANT_SK") and
+        labDelta("SOURCE_SYSTEM") === medclaim_header_historyDF()("SOURCE_SYSTEM") and
+        labDelta("CLAIM_NUMBER") === medclaim_header_historyDF()("CLAIM_NUMBER"))
+      .whenNotMatched
+      .insert(allColumns)
+      .collect()
 
       println(s"CdosMedclaimHeader 4 : ${java.time.LocalDateTime.now}")
 
-      val headerLatestVersion = spark.sql(s"""DESCRIBE HISTORY  """ + medDbName + "." + targetMarket  + "_medclaim_header" + """  """ ).orderBy(col("version").desc).first.getLong(0)
-      val detailsLatestVersionDF = spark.sql("Select Latest_Detail_Version as version from " + medDbName + "." + targetMarket  + "_medclaim_details_version")
+      val headerLatestVersion = sfCDCM.sql(s"""DESCRIBE HISTORY  """ + medDbName + "." + targetMarket  + "_medclaim_header" + """  """ ).orderBy(col("version").desc).first.getLong(0)
+      val detailsLatestVersionDF = sfCDCM.sql("Select Latest_Detail_Version as version from " + medDbName + "." + targetMarket  + "_medclaim_details_version")
       val detailsLatestVersion = detailsLatestVersionDF.select("version").collect()(0)(0)
 
       println(s"CdosMedclaimHeader 5 : ${java.time.LocalDateTime.now}")
 
-      //////////////////////////////////////////
-      // Merge conditions for the delta table //
-      //////////////////////////////////////////
-      val updateConditions =
-        """
-          delta.SOURCE_SYSTEM = source.SOURCE_SYSTEM AND
-          delta.TENANT_SK = source.TENANT_SK AND
-          delta.CLAIM_NUMBER = source.CLAIM_NUMBER AND
-          delta.HASH <> source.HASH
-      """
-
-      val insertConditions =
-        """
-          delta.SOURCE_SYSTEM = source.SOURCE_SYSTEM AND
-          delta.TENANT_SK = source.TENANT_SK AND
-          delta.CLAIM_NUMBER = source.CLAIM_NUMBER
-      """
-      // update any records where the hashes do not match.
-      deltaDF
-        .as("delta")
-        .merge(medclaim_header_historyDF.as("source"), updateConditions)
-        .whenMatched
-        .updateAll
-        .execute
-
-      println(s"CdosMedclaimHeader 6 : ${java.time.LocalDateTime.now}")
-
-      // add any new inserts to the table.
-      deltaDF
-        .as("delta")
-        .merge(medclaim_header_historyDF.as("source"), insertConditions)
-        .whenNotMatched
-        .insertAll
-        .execute
-
       def headerCurrentVersion() = {
-        spark.sql(s"""DESCRIBE HISTORY """ + medDbName + "." + targetMarket + "_medclaim_header" + """  """).filter(col("operation") === "MERGE").orderBy(col("version").desc).first.getLong(0)
+        sfCDCM.sql(s"""DESCRIBE HISTORY """ + medDbName + "." + targetMarket + "_medclaim_header" + """  """).filter(col("operation") === "MERGE").orderBy(col("version").desc).first.getLong(0)
       }
 
       def detailsCurrentVersion() = {
-        spark.sql(s"""DESCRIBE HISTORY """ + medDbName + "." + targetMarket + "_medclaim_details" + """  """).filter(col("operation") === "MERGE").orderBy(col("version").desc).first.getLong(0)
+        sfCDCM.sql(s"""DESCRIBE HISTORY """ + medDbName + "." + targetMarket + "_medclaim_details" + """  """).filter(col("operation") === "MERGE").orderBy(col("version").desc).first.getLong(0)
       }
 
       println(s"CdosMedclaimHeader 7 : ${java.time.LocalDateTime.now}")
@@ -1522,16 +1511,17 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
       def getExtractDate_medclaimdetails(targetMarket: String, dbName: String): String = {
         val targetMarketUC = targetMarket.toUpperCase()
         val sqlQuery = s"""select max(timestamp) from (DESCRIBE HISTORY """ + dbName + "." + targetMarket + "_medclaim_details" + """ ) where operation = 'MERGE' """
-        val extractDt = spark.sql(sqlQuery).collect()(0)(0)
+        val extractDt = sfCDCM.sql(sqlQuery).collect()(0)(0)
         extractDt.toString
       }
 
       def getExtractDate_medclaimheader(targetMarket: String, dbName: String): String = {
         val targetMarketUC = targetMarket.toUpperCase()
         val sqlQuery = s"""select max(timestamp) from (DESCRIBE HISTORY """ + dbName + "." + targetMarket + "_medclaim_header" + """) where operation = 'MERGE' """
-        val extractDt = spark.sql(sqlQuery).collect()(0)(0)
+        val extractDt = sfCDCM.sql(sqlQuery).collect()(0)(0)
         extractDt.toString
       }
+
       val max_DT_medclaims_details = getExtractDate_medclaimdetails(targetMarket, medDbName).substring(0, 10)
       val max_DT_medclaims_header = getExtractDate_medclaimheader(targetMarket, medDbName).substring(0, 10)
 
@@ -1540,8 +1530,6 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
       println("")
       print(max_DT_medclaims_header)
 
-      
-
       var headerStartDate = cdosBase.lastExtractDT.substring(0, 19);
       println("headerStartDate"+headerStartDate)
       var detailsStartDate = sfCDCM.sql(String.format("SELECT PREVIOUS_LAST_EXTRACT_DT FROM " + dbName +"_" + targetMarket + "_last_extract_info WHERE FILE_NAME = 'medclaim_details'", targetMarket.toUpperCase())).select("PREVIOUS_LAST_EXTRACT_DT").collect().map(_.getTimestamp(0)).mkString("");
@@ -1549,14 +1537,14 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
 
       println("detailsStartDate"+detailsStartDate)
 
-      var headerInsMaxCommitDT = spark.sql(String.format("select max(_commit_timestamp) AS commit_timestamp  from table_changes('" +  medDbName +"." + targetMarket + "_medclaim_header', '" + max_DT_medclaims_header +"') where _change_type = 'insert'")).select("commit_timestamp").collect().map(_.getTimestamp(0)).mkString("");
+      var headerInsMaxCommitDT = sfCDCM.sql(String.format("select max(_commit_timestamp) AS commit_timestamp  from table_changes('" +  medDbName +"." + targetMarket + "_medclaim_header', '" + max_DT_medclaims_header +"') where _change_type = 'insert'")).select("commit_timestamp").collect().map(_.getTimestamp(0)).mkString("");
 
       println("headerInsMaxcommit")
-      var headerUpdMaxCommitDT = spark.sql(String.format("select max(_commit_timestamp) aS commit_timestamp from table_changes('" +  medDbName +"." + targetMarket + "_medclaim_header', '" + max_DT_medclaims_header +"') where _change_type = 'update_postimage'")).select("commit_timestamp").collect().map(_.getTimestamp(0)).mkString("");
+      var headerUpdMaxCommitDT = sfCDCM.sql(String.format("select max(_commit_timestamp) aS commit_timestamp from table_changes('" +  medDbName +"." + targetMarket + "_medclaim_header', '" + max_DT_medclaims_header +"') where _change_type = 'update_postimage'")).select("commit_timestamp").collect().map(_.getTimestamp(0)).mkString("");
 
-      var detailInsMaxCommitDT = spark.sql(String.format("select max(_commit_timestamp) As commit_timestamp from table_changes('" +  medDbName +"." + targetMarket +  "_medclaim_details' , '" + max_DT_medclaims_details +"') where _change_type = 'insert'")).select("commit_timestamp").collect().map(_.getTimestamp(0)).mkString("");
+      var detailInsMaxCommitDT = sfCDCM.sql(String.format("select max(_commit_timestamp) As commit_timestamp from table_changes('" +  medDbName +"." + targetMarket +  "_medclaim_details' , '" + max_DT_medclaims_details +"') where _change_type = 'insert'")).select("commit_timestamp").collect().map(_.getTimestamp(0)).mkString("");
 
-      var detailUpdMaxCommitDT = spark.sql(String.format("select max(_commit_timestamp) as commit_timestamp from table_changes('" +  medDbName +"." + targetMarket +"_medclaim_details','" + max_DT_medclaims_details +"') where _change_type = 'update_postimage'")).select("commit_timestamp").collect().map(_.getTimestamp(0)).mkString("");
+      var detailUpdMaxCommitDT = sfCDCM.sql(String.format("select max(_commit_timestamp) as commit_timestamp from table_changes('" +  medDbName +"." + targetMarket +"_medclaim_details','" + max_DT_medclaims_details +"') where _change_type = 'update_postimage'")).select("commit_timestamp").collect().map(_.getTimestamp(0)).mkString("");
 
 
       // Show what dates we are seaching for:
@@ -1604,26 +1592,26 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
       println(s"CdosMedclaimHeader 9 : ${java.time.LocalDateTime.now}")
 
       val update_variable = "UPDATE "
-      spark.sql(update_variable + medDbName + "." + targetMarket +  "_medclaim_header as HDR SET UPDATE_TYPE = 'ORIGINAL' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE <>'DELETE' AND EXISTS (" + headerInserts + ")");
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket +  "_medclaim_header as HDR SET UPDATE_TYPE = 'ORIGINAL' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE <>'DELETE' AND EXISTS (" + headerInserts + ")");
 
-      spark.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'ORIGINAL' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE <>'DELETE' AND EXISTS (" + detailInserts + ")");
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'ORIGINAL' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE <>'DELETE' AND EXISTS (" + detailInserts + ")");
 
-      spark.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'ADJUSTMENT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE NOT IN ('DELETE', 'BACKOUT') AND  EXISTS (" + headerUpdates + ")");
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'ADJUSTMENT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE NOT IN ('DELETE', 'BACKOUT') AND  EXISTS (" + headerUpdates + ")");
 
-      spark.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'ADJUSTMENT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE NOT IN ('DELETE', 'BACKOUT') AND EXISTS (" + detailUpdates + ")");
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'ADJUSTMENT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE NOT IN ('DELETE', 'BACKOUT') AND EXISTS (" + detailUpdates + ")");
 
 
-      spark.sql(update_variable + medDbName + "." + targetMarket +  "_medclaim_header as HDR SET UPDATE_TYPE = 'DELETE' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='DELETE' AND EXISTS (" + headerInserts + ")");
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket +  "_medclaim_header as HDR SET UPDATE_TYPE = 'DELETE' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='DELETE' AND EXISTS (" + headerInserts + ")");
 
-      spark.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'DELETE' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='DELETE' AND EXISTS (" + headerUpdates + ")");
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'DELETE' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='DELETE' AND EXISTS (" + headerUpdates + ")");
 
-      spark.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'BACKOUT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='BACKOUT' AND EXISTS (" + headerInserts + ")")
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'BACKOUT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='BACKOUT' AND EXISTS (" + headerInserts + ")")
   
-      spark.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'BACKOUT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='BACKOUT' AND EXISTS (" + headerUpdates + ")")
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'BACKOUT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='BACKOUT' AND EXISTS (" + headerUpdates + ")")
 
-      spark.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'BACKOUT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='BACKOUT' AND EXISTS (" + detailUpdates + ")")
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'BACKOUT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='BACKOUT' AND EXISTS (" + detailUpdates + ")")
 
-      spark.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'BACKOUT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='BACKOUT' AND EXISTS (" + detailInserts + ")")
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header as HDR SET UPDATE_TYPE = 'BACKOUT' WHERE UPDATE_TYPE ='' AND CLAIM_ADJUST_TYPE ='BACKOUT' AND EXISTS (" + detailInserts + ")")
 
       println(s"CdosMedclaimHeader 10 : ${java.time.LocalDateTime.now}")
 
@@ -1637,7 +1625,7 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
 
       val clmHdrCk = "select distinct CLAIM_NUMBER FROM " + medDbName + "." + targetMarket + "_medclaim_header WHERE UPDATE_TYPE IN ('ORIGINAL', 'ADJUSTMENT', 'BACKOUT')"
 
-      val incrementalEvents = spark.sql(select_variable + medDbName + "." + targetMarket + "_medclaim_details WHERE CLAIM_NUMBER IN (" + updatesQuery + ") AND CLAIM_NUMBER IN (" + clmHdrCk + ")")
+      val incrementalEvents = sfCDCM.sql(select_variable + medDbName + "." + targetMarket + "_medclaim_details WHERE CLAIM_NUMBER IN (" + updatesQuery + ") AND CLAIM_NUMBER IN (" + clmHdrCk + ")")
 
       val medclaim_details_historyDF =
         incrementalEvents.select(
@@ -1716,17 +1704,10 @@ class CdosMedclaimHeader(var notebookParams: scala.collection.mutable.Map[String
 
       println(s"CdosMedclaimHeader 19 : ${java.time.LocalDateTime.now}")
 
-var medclaim_details_hist_df = spark.read
-        .format("snowflake")
-        .options(sfOptions)
-        .option("dbtable", detailshistoryTable)
-        .load()
-medclaim_details_hist_df.write.format("delta").mode("overwrite").saveAsTable(temp_details_history_table)
+      var medclaim_details_hist_df = sfCDCM.table(detailshistoryTable)
+      medclaim_details_hist_df.write.mode(com.snowflake.snowpark.SaveMode.Overwrite).saveAsTable(temp_details_history_table)
 
       println(s"CdosMedclaimHeader 20 : ${java.time.LocalDateTime.now}")
-
-
-
 
       cdosBase.archiveExtracts(tmForFileNameDtl + "_Hist_" + "MedClaim_D" + "_")
 
@@ -1738,7 +1719,7 @@ medclaim_details_hist_df.write.format("delta").mode("overwrite").saveAsTable(tem
 
       var medclaim_details_DeltaDF_sp_table = dbName + targetMarket+"_medclaim_details_DeltaDF_sp_" 
       cdosBaseMedclaims.createSnowflakeTable(medclaim_details_DeltaDF_sp_table, medclaim_details_DeltaDF)
-      var medclaim_details_DeltaDF_sp_df = cdosBase.getDataFromSnowflakeTable(medclaim_details_DeltaDF_sp_table)
+      var medclaim_details_DeltaDF_sp_df = sfCDCM.table(medclaim_details_DeltaDF_sp_table)
 
       println(s"CdosMedclaimHeader 23 : ${java.time.LocalDateTime.now}")
 
@@ -1751,7 +1732,7 @@ medclaim_details_hist_df.write.format("delta").mode("overwrite").saveAsTable(tem
 
       println(s"CdosMedclaimHeader 25 : ${java.time.LocalDateTime.now}")
 
-      medclaim_details_historyDF.createOrReplaceTempView("medclaim_details_historyDF_withoutdefault_Del_Ind0")
+      val medclaim_details_historyDF_withoutdefault_Del_Ind0 = medclaim_details_historyDF
       println("medclaim_details_historyDF_withoutdefault_Del_Ind0 view created")
       val medclaim_details_del_ind_1 = incrementalEvents.select(
         "TENANT_SK",
@@ -1784,14 +1765,13 @@ medclaim_details_hist_df.write.format("delta").mode("overwrite").saveAsTable(tem
 
       println(s"CdosMedclaimHeader 26 : ${java.time.LocalDateTime.now}")
 
-      medclaim_details_del_ind_1.createOrReplaceTempView("medclaim_details_historyDF_withoutdefault_Del_Ind1")
-      //----------------------------------Start Medclaim Header--------------------------------------------
+      ]//----------------------------------Start Medclaim Header--------------------------------------------
       println("STARTING MEDCLAIMS HEADER")
       val medclaim_header_historyDF_withoutdefault_both_del_ind_query = cdosBaseMedclaims.getDataframeFromDeltaLake(medclaim_header_historyDF_withoutdefault_both_del_ind)
 
       println(s"CdosMedclaimHeader 27 : ${java.time.LocalDateTime.now}")
 
-      val medclaim_header_historyDF_withoutdefault = spark.sql(medclaim_header_historyDF_withoutdefault_query)
+      val medclaim_header_historyDF_withoutdefault = sfCDCM.sql(medclaim_header_historyDF_withoutdefault_query)
 
       println(s"CdosMedclaimHeader 28 : ${java.time.LocalDateTime.now}")
 
@@ -1799,12 +1779,12 @@ medclaim_details_hist_df.write.format("delta").mode("overwrite").saveAsTable(tem
       if (RunType == "Hist" && "SDM2".equals(CdosConfigMapMedclaims.sdm_type)) {
         val medclaim_header_historyDF_both_del_ind_str = cdosBaseMedclaims.defaultTable_insertion(targetMarket.toUpperCase, domainName, medclaim_header_historyDF_withoutdefault_both_del_ind_query)
         medclaim_header_historyDF_both_del_ind=medclaim_header_historyDF_both_del_ind_str
-          .withColumn("Charge_Amount",col("Charge_Amount").cast("decimal(32,2)"))
+          .withColumn("Charge_Amount", col("Charge_Amount").cast(DecimalType(32, 2)))
       }
       if (RunType == "Hist" && "SDM3".equals(CdosConfigMapMedclaims.sdm_type)) {
         val medclaim_header_historyDF_both_del_ind_str = cdosBaseMedclaims.defaultTable_insertion(targetMarket.toUpperCase, domainName, medclaim_header_historyDF_withoutdefault_both_del_ind_query)
         medclaim_header_historyDF_both_del_ind=medclaim_header_historyDF_both_del_ind_str
-          .withColumn("Charge_Amount",col("Charge_Amount").cast("string"))
+          .withColumn("Charge_Amount", col("Charge_Amount").cast(StringType))
       }
 
       println(s"CdosMedclaimHeader 29 : ${java.time.LocalDateTime.now}")
@@ -1813,11 +1793,11 @@ medclaim_details_hist_df.write.format("delta").mode("overwrite").saveAsTable(tem
       var medclaim_header_historyDF_1: DataFrame = null
       if ("SDM2".equals(CdosConfigMapMedclaims.sdm_type)) {
         medclaim_header_historyDF_1 =medclaim_header_historyDF_1_str
-          .withColumn("Charge_Amount",col("Charge_Amount").cast("decimal(32,2)"))
+          .withColumn("Charge_Amount", col("Charge_Amount").cast(DecimalType(32, 2)))
       }
       if ("SDM3".equals(CdosConfigMapMedclaims.sdm_type)) {
         medclaim_header_historyDF_1 =medclaim_header_historyDF_1_str
-          .withColumn("Charge_Amount",col("Charge_Amount").cast("string"))
+          .withColumn("Charge_Amount", col("Charge_Amount").cast(StringType))
       }
 
       println(s"CdosMedclaimHeader 30 : ${java.time.LocalDateTime.now}")
@@ -1863,11 +1843,11 @@ medclaim_details_hist_df.write.format("delta").mode("overwrite").saveAsTable(tem
         println("loadExtractsHistoryTableMedclaims runtype header")
       }
 
-      spark.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header SET UPDATE_TYPE = '' WHERE TRIM(UPDATE_TYPE) in ('ORIGINAL', 'ADJUSTMENT','DELETE','BACKOUT')")
+      sfCDCM.sql(update_variable + medDbName + "." + targetMarket + "_medclaim_header SET UPDATE_TYPE = '' WHERE TRIM(UPDATE_TYPE) in ('ORIGINAL', 'ADJUSTMENT','DELETE','BACKOUT')")
       cdosBase.updatePreviousExtractDate(cdosBase.lastExtractDT, targetMarket, domainName)
       cdosBase.updateLastExtractDT_exceptinscope()
-      spark.sql("drop table if exists "+temp_details_history_table)
-      spark.sql("drop table if exists "+temp_inscope_patient_table)
+      sfCDCM.sql("drop table if exists "+temp_details_history_table)
+      sfCDCM.sql("drop table if exists "+temp_inscope_patient_table)
 
       cdosBase.dropSnowflakeTable(medclaim_header_Delta_sp_table)
       cdosBase.dropSnowflakeTable(medclaim_details_DeltaDF_sp_table)

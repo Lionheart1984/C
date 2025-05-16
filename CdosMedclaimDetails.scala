@@ -16,10 +16,11 @@
 // COMMAND ----------
 
 import com.databricks.dbutils_v1.DBUtilsHolder.dbutils
-import org.apache.spark.sql.functions._
-import scala.language.{postfixOps, reflectiveCalls}
-import org.apache.spark.sql.types._
-import org.apache.spark.sql.{DataFrame, Row}
+import com.snowflake.snowpark.{DataFrame=>SpDataFrame}
+import com.snowflake.snowpark._
+import com.snowflake.snowpark.types.{StringType, StructField, StructType}
+import com.snowflake.snowpark.functions._
+import com.snowflake.snowpark.Session
 import com.snowflake.snowpark.Session
 import java.time.ZoneOffset
 class CdosMedclaimDetails(var notebookParams: scala.collection.mutable.Map[String, String], sfCDCM: Session) extends SparkSessionWrapper {
@@ -59,16 +60,7 @@ class CdosMedclaimDetails(var notebookParams: scala.collection.mutable.Map[Strin
     {timeTravel = cdosBase.getTimeTravel(domainName, targetMarket)}
   timeTravelDate = cdosBase.getDateForLookbackPeriod(timeTravel)
   println("timeTravelDate: " + timeTravelDate)
-  val snowflakeParams = cdosBase.setSnowflakeparameters().asInstanceOf[scala.collection.mutable.Map[String, String]]
-  val sfOptions = Map(
-    "sfUrl" ->  snowflakeParams("sfUrl"),
-    "sfUser" -> snowflakeParams("sfUser"),
-    "pem_private_key" -> snowflakeParams("pem_private_key"),
-    "sfWarehouse" -> snowflakeParams("sfWarehouse"),
-    "sfDatabase" ->snowflakeParams("sfDatabase"),
-    "SCHEMA" -> "CDCM_REFINED"
-  )
-
+  
   var tenant = notebookParams("tenant")
   val TENANT_NUMBER = "(" + tenant + ")"
   var source = if (sourceSystem != "All") " AND cld.source_system_sk in (" + sourceSystem + ")" else "";
@@ -266,24 +258,27 @@ class CdosMedclaimDetails(var notebookParams: scala.collection.mutable.Map[Strin
     var sourceDF = cdosBaseMedclaims.getDataframeFromSnowflake(targetQuery, cdosBaseMedclaims.sfSchema)
     //Drop and Write to the Table
     cdosBaseMedclaims.dropTableifExists(medclaimDetailSourceTbl)
-    cdosBaseMedclaims.writeDataFrameToDeltaLake(sourceDF, medclaimDetailSourceTbl, "overWrite")
-    println("writeDataFrameToDeltaLake done")
+    println("Dropped labresultSourceTable:" + labresultSourceTable)
+    println("cdosBase.dropTableifExists(labresultSourceTable) completed")
+    cdosBaseMedclaims.writeDataFrameToSnowflake(sourceDF, medclaimDetailSourceTbl, "overWrite")
+    
+
 
     println(s"CdosMedclaimDetails 4 : ${java.time.LocalDateTime.now}")
     
     val inscope_patient_sp_table = dbName + "_" + targetMarket + "_inscope_patient"
     val inscope_patient_sp_table_query = "select * from "+inscope_patient_sp_table
-    var inscopeDf_sp= spark.read
-      .format("snowflake")
-      .options(sfOptions)
-      .option("query", inscope_patient_sp_table_query)
-      .load
-
+    var inscopeDf_sp= sfCDCM.sql(inscope_patient_sp_table_query)
+     
+    
     val temp_inscope_patient_table = medDbName+"."+"temp_inscope_patient_sp_"+targetMarket
     println("temp_inscope_patient_table: "+temp_inscope_patient_table)
     println("temp_inscope_patient_table end")
-    inscopeDf_sp.write.format("delta").mode("overwrite").saveAsTable(temp_inscope_patient_table)
-    println("inscopeDf_sp wrote to catalog")
+    
+    cdosBaseMedclaims.dropTableifExists(temp_inscope_patient_table)
+    cdosBaseMedclaims.writeDataFrameToSnowflake(inscopeDf_sp, temp_inscope_patient_table, "overWrite")
+    println("inscopeDf_sp wrote to Snowflake")
+    
 
     medclaimDetailDFQuery= medclaimDetailDFQuery+"""FROM """ + medDbName + "." + targetMarket + "_" + domainName + "_source" +
       """ cld
@@ -300,7 +295,7 @@ class CdosMedclaimDetails(var notebookParams: scala.collection.mutable.Map[Strin
     println("temp_incope_count: "+temp_incope_count)
 
        
-    val medclaimDetailDF = cdosBaseMedclaims.getDataframeFromDeltaLake(medclaimDetailDFQuery)
+    val medclaimDetailDF = sfCDCM.sql(medclaimDetailDFQuery)
 
     println(s"CdosMedclaimDetails 5 : ${java.time.LocalDateTime.now}")
 
@@ -326,56 +321,55 @@ class CdosMedclaimDetails(var notebookParams: scala.collection.mutable.Map[Strin
 
     println(s"CdosMedclaimDetails 7 : ${java.time.LocalDateTime.now}")
 
-    import io.delta.tables._
-    val target = DeltaTable
-      .createIfNotExists()
-      .tableName(medclaimDetailTbl)
-      .property("delta.enableChangeDataFeed", "true")
-      .addColumns(medclaimDetailDF_history_preincremental.schema)
-      .execute
+    // Create table if not exists
+    var doesTableExistCount = sfCDCM.sql("select count(*) from INFORMATION_SCHEMA.TABLES where table_name = upper('" + medclaimDetailTbl.split("\\.").last + "')").collect()(0)(0)
+    
+    if (doesTableExistCount == 0) {
+      medclaimDetailDF_history_preincremental.limit(0)
+        .write.mode(com.snowflake.snowpark.SaveMode.Append)
+        .saveAsTable(medclaimDetailTbl)
+    }
 
-     println(s"CdosMedclaimDetails 8 : ${java.time.LocalDateTime.now}") 
+    // Enable change tracking
+    sfCDCM.sql("alter table " + medclaimDetailTbl + " set change_tracking = true;").collect()
 
-    val detailsLatestVersion = spark.sql(s"""DESCRIBE HISTORY """ + medDbName + "." + targetMarket  + "_medclaim_details" + """  """ ).orderBy(col("version").desc).first.getLong(0)
+    println(s"CdosMedclaimDetails 8 : ${java.time.LocalDateTime.now}")
 
-    val versionSchema = org.apache.spark.sql.types.StructType(Array(org.apache.spark.sql.types.StructField("Latest_Detail_Version", org.apache.spark.sql.types.LongType, nullable = false)))
+    // Get current timestamp for time travel
+    val snowflakeFormattedDate = sfCDCM.sql("select current_timestamp() as SnowflakeFormattedDate").select("SnowflakeFormattedDate").collect().map(_.getTimestamp(0)).mkString("")
 
-    val versionDF = spark.createDataFrame(spark.sparkContext.parallelize(Array(Row(detailsLatestVersion))), versionSchema)
-    cdosBaseMedclaims.writeDataFrameToDeltaLake(versionDF, medclaimVersionTbl, "overWrite")
+    val targetTable = sfCDCM.table(medclaimDetailTbl)
+    val allColumns = medclaimDetailDF_history_preincremental.schema.map(f => f.name -> medclaimDetailDF_history_preincremental(f.name)).toMap
+
+    // Merge operation for updates
+    targetTable
+      .merge(medclaimDetailDF_history_preincremental,
+        targetTable("CLAIM_NUMBER") === medclaimDetailDF_history_preincremental("CLAIM_NUMBER") &&
+        targetTable("SERVICE_LINE") === medclaimDetailDF_history_preincremental("SERVICE_LINE") &&
+        !(targetTable("HASH") === medclaimDetailDF_history_preincremental("HASH")))
+      .whenMatched
+      .update(allColumns)
+      .collect()
+
+    // Merge operation for inserts
+    targetTable
+      .merge(medclaimDetailDF_history_preincremental,
+        targetTable("CLAIM_NUMBER") === medclaimDetailDF_history_preincremental("CLAIM_NUMBER") &&
+        targetTable("SERVICE_LINE") === medclaimDetailDF_history_preincremental("SERVICE_LINE"))
+      .whenNotMatched
+      .insert(allColumns)
+      .collect()
 
     println(s"CdosMedclaimDetails 9 : ${java.time.LocalDateTime.now}")
 
-    val updateConditions =
-      """
-        target.CLAIM_NUMBER = source.CLAIM_NUMBER
-        AND target.SERVICE_LINE = source.SERVICE_LINE
-        AND target.HASH <> source.HASH
-    """;
+    // Get latest version
+    val detailsLatestVersion = sfCDCM.sql(s"""SELECT MAX(CHANGE_TRACKING_CURRENT_VERSION()) FROM """ + medclaimDetailTbl).collect()(0)(0).asInstanceOf[Long]
 
-    // update any records where the hashes do not match.
-    target
-      .as("target")
-      .merge(medclaimDetailDF_history_preincremental.as("source"), updateConditions)
-      .whenMatched
-      .updateAll
-      .execute
+    // Create version table
+    val versionDF = sfCDCM.createDataFrame(Seq(Row(detailsLatestVersion)), StructType(Seq(StructField("Latest_Detail_Version", LongType, false))))
+    cdosBaseMedclaims.writeDataFrameToSnowflake(versionDF, medclaimVersionTbl, "overWrite")
 
     println(s"CdosMedclaimDetails 10 : ${java.time.LocalDateTime.now}")
-
-    val insertConditions =
-      """
-        target.CLAIM_NUMBER = source.CLAIM_NUMBER
-        AND target.SERVICE_LINE = source.SERVICE_LINE
-    """;
-    // add any new inserts to the table.
-    target
-      .as("target")
-      .merge(medclaimDetailDF_history_preincremental.as("source"), insertConditions)
-      .whenNotMatched
-      .insertAll
-      .execute
-
-    println(s"CdosMedclaimDetails 11 : ${java.time.LocalDateTime.now}")
 
     val status = "Success"
     return domainName + status
